@@ -1,0 +1,4 @@
+hydrogram
+tgcrypto
+mysql-connector-python
+python-dotenv

@@ -1,0 +1,9 @@
+# Telegram sessions grant full access to the account
+*.session
+*.session-journal
+*.session-shm
+*.session-wal
+
+.env
+__pycache__/
+.venv/

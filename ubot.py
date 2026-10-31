@@ -8,6 +8,7 @@ import logging
 import os
 
 import mysql.connector
+from mysql.connector import pooling
 from dotenv import load_dotenv
 from hydrogram import Client, filters
 
@@ -27,16 +28,21 @@ DB_CONFIG = {
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("userbot")
 
+# One long-lived pool created at startup. Each call borrows a connection and
+# returns it on close, so we no longer open a fresh connection per event.
+db_pool = pooling.MySQLConnectionPool(pool_name="userbot", pool_size=3, **DB_CONFIG)
+
 app = Client(
     os.environ.get("SESSION_NAME", "my_account"),
     api_id=int(os.environ["TG_API_ID"]),
     api_hash=os.environ["TG_API_HASH"],
+    sleep_threshold=60,
 )
 
 
 def find_copy(source_id):
     """Return the id of the target-channel copy of a source message, or None."""
-    db = mysql.connector.connect(**DB_CONFIG)
+    db = db_pool.get_connection()
     try:
         cursor = db.cursor()
         cursor.execute("SELECT receive_id FROM tradingpost WHERE send_id = %s", (source_id,))
@@ -48,10 +54,16 @@ def find_copy(source_id):
 
 
 def save_copy(source_id, copy_id):
-    db = mysql.connector.connect(**DB_CONFIG)
+    db = db_pool.get_connection()
     try:
         cursor = db.cursor()
-        cursor.execute("INSERT INTO tradingpost (send_id, receive_id) VALUES (%s, %s)", (source_id, copy_id))
+        # ON DUPLICATE KEY UPDATE keeps a redelivered message from raising an
+        # IntegrityError on the send_id primary key.
+        cursor.execute(
+            "INSERT INTO tradingpost (send_id, receive_id) VALUES (%s, %s) "
+            "ON DUPLICATE KEY UPDATE receive_id = VALUES(receive_id)",
+            (source_id, copy_id),
+        )
         db.commit()
         cursor.close()
     finally:
@@ -60,35 +72,42 @@ def save_copy(source_id, copy_id):
 
 @app.on_message(filters.chat(SOURCE_CHAT_ID))
 async def mirror_post(client, message):
-    reply_to = None
-    if message.reply_to_message_id is not None:
-        reply_to = find_copy(message.reply_to_message_id)
-        if reply_to is None:
-            log.warning("Skipped reply %s: the message it answers was never mirrored", message.id)
-            return
+    try:
+        reply_to = None
+        if message.reply_to_message_id is not None:
+            reply_to = find_copy(message.reply_to_message_id)
+            if reply_to is None:
+                # The parent was never mirrored, so post the message on its own
+                # instead of dropping it.
+                log.warning("Reply %s answers a message that was never mirrored; posting unthreaded", message.id)
 
-    copy = await client.copy_message(TARGET_CHAT_ID, message.chat.id, message.id, reply_to_message_id=reply_to)
-    save_copy(message.id, copy.id)
-    log.info("Mirrored post %s as %s", message.id, copy.id)
+        copy = await client.copy_message(TARGET_CHAT_ID, message.chat.id, message.id, reply_to_message_id=reply_to)
+        save_copy(message.id, copy.id)
+        log.info("Mirrored post %s as %s", message.id, copy.id)
+    except Exception:
+        log.exception("Failed to mirror post %s", message.id)
 
 
 @app.on_edited_message(filters.chat(SOURCE_CHAT_ID))
 async def mirror_edit(client, message):
-    copy_id = find_copy(message.id)
-    if copy_id is None:
-        log.warning("Skipped edit of %s: no mirrored copy found", message.id)
-        return
+    try:
+        copy_id = find_copy(message.id)
+        if copy_id is None:
+            log.warning("Skipped edit of %s: no mirrored copy found", message.id)
+            return
 
-    if message.text is not None:
-        await client.edit_message_text(
-            TARGET_CHAT_ID, copy_id, message.text, entities=message.entities, disable_web_page_preview=True
-        )
-    else:
-        # Media posts carry their text in the caption.
-        await client.edit_message_caption(
-            TARGET_CHAT_ID, copy_id, message.caption or "", caption_entities=message.caption_entities
-        )
-    log.info("Mirrored edit of %s", message.id)
+        if message.text is not None:
+            await client.edit_message_text(
+                TARGET_CHAT_ID, copy_id, message.text, entities=message.entities, disable_web_page_preview=True
+            )
+        else:
+            # Media posts carry their text in the caption.
+            await client.edit_message_caption(
+                TARGET_CHAT_ID, copy_id, message.caption or "", caption_entities=message.caption_entities
+            )
+        log.info("Mirrored edit of %s", message.id)
+    except Exception:
+        log.exception("Failed to mirror edit of %s", message.id)
 
 
 if __name__ == "__main__":

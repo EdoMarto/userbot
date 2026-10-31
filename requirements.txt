@@ -1,4 +1,4 @@
-hydrogram
-tgcrypto
-mysql-connector-python
-python-dotenv
+hydrogram>=0.2,<0.3
+tgcrypto>=1.2,<2
+mysql-connector-python>=26.10,<27
+python-dotenv>=1.2,<2
